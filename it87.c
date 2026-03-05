@@ -66,6 +66,7 @@
 #include <linux/hwmon-vid.h>
 #include <linux/err.h>
 #include <linux/mutex.h>
+#include <linux/lockdep.h>
 #include <linux/sysfs.h>
 #include <linux/string.h>
 #include <linux/dmi.h>
@@ -1084,9 +1085,17 @@ static void _it87_io_write(struct it87_data *data, u16 reg, u8 value)
 	outb_p(value, data->addr + IT87_DATA_REG_OFFSET);
 }
 
+/*
+ * Disable SMBus access to avoid conflicts with hardware monitoring.
+ * Must be called with data->update_lock held (except during probe/init).
+ */
 static int smbus_disable(struct it87_data *data)
 {
 	int err;
+
+	/* Verify locking in non-init contexts (after device is initialized) */
+	if (data->valid)
+		lockdep_assert_held(&data->update_lock);
 
 	if (data->smbus_bitmap) {
 		err = superio_enter(data->sioaddr, has_noconf(data));
@@ -1102,9 +1111,17 @@ static int smbus_disable(struct it87_data *data)
 	return 0;
 }
 
+/*
+ * Re-enable SMBus access after hardware monitoring operations.
+ * Must be called with data->update_lock held (except during probe/init).
+ */
 static int smbus_enable(struct it87_data *data)
 {
 	int err;
+
+	/* Verify locking in non-init contexts (after device is initialized) */
+	if (data->valid)
+		lockdep_assert_held(&data->update_lock);
 
 	if (data->smbus_bitmap) {
 		if (has_bank_sel(data) && !data->mmio)
@@ -1133,6 +1150,8 @@ static u8 it87_io_set_bank(struct it87_data *data, u8 bank)
 			breg &= 0x1f;
 			breg |= (bank << 5);
 			_it87_io_write(data, IT87_REG_BANK, breg);
+			/* Read back to ensure the write completed before proceeding */
+			_it87_io_read(data, IT87_REG_BANK);
 		}
 	}
 	return _bank;
@@ -1143,11 +1162,17 @@ static u8 it87_io_set_bank(struct it87_data *data, u8 bank)
  * Must be called with SMBus accesses disabled.
  * We ignore the IT87 BUSY flag at this moment - it could lead to deadlocks,
  * would slow down the IT87 access and should not be necessary.
+ *
+ * Locking: Callers must hold data->update_lock (except during probe/init).
  */
 static int it87_io_read(struct it87_data *data, u16 reg)
 {
 	u8 bank;
 	int val;
+
+	/* Verify locking in non-init contexts (after device is initialized) */
+	if (data->valid)
+		lockdep_assert_held(&data->update_lock);
 
 	bank = it87_io_set_bank(data, reg >> 8);
 	val = _it87_io_read(data, reg & 0xff);
@@ -1161,10 +1186,16 @@ static int it87_io_read(struct it87_data *data, u16 reg)
  * Must be called with SMBus accesses disabled.
  * We ignore the IT87 BUSY flag at this moment - it could lead to deadlocks,
  * would slow down the IT87 access and should not be necessary.
+ *
+ * Locking: Callers must hold data->update_lock (except during probe/init).
  */
 static void it87_io_write(struct it87_data *data, u16 reg, u8 value)
 {
 	u8 bank;
+
+	/* Verify locking in non-init contexts (after device is initialized) */
+	if (data->valid)
+		lockdep_assert_held(&data->update_lock);
 
 	bank = it87_io_set_bank(data, reg >> 8);
 	_it87_io_write(data, reg & 0xff, value);
@@ -1245,7 +1276,11 @@ static int it87_lock(struct it87_data *data)
 
 static void it87_unlock(struct it87_data *data)
 {
-	smbus_enable(data);
+	int err;
+
+	err = smbus_enable(data);
+	if (err)
+		pr_warn("Failed to re-enable SMBus: %d\n", err);
 	mutex_unlock(&data->update_lock);
 }
 
@@ -3160,7 +3195,7 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 		/* If only one value given use for all chips */
 		if (force_id[0])
 			chip_type = force_id[0];
-	} else if (force_id[chip_cnt])
+	} else if (chip_cnt < ARRAY_SIZE(force_id) && force_id[chip_cnt])
 		chip_type = force_id[chip_cnt];
 
 	switch (chip_type) {
@@ -3959,7 +3994,7 @@ static void it87_check_tachometers_reset(struct platform_device *pdev)
 	if ((fan_main_ctrl & mask) == 0) {
 		/* Enable all fan tachometers */
 		fan_main_ctrl |= mask;
-		data->write(data, IT87_REG_FAN_MAIN_CTRL, data->fan_main_ctrl);
+		data->write(data, IT87_REG_FAN_MAIN_CTRL, fan_main_ctrl);
 	}
 }
 
@@ -4239,7 +4274,9 @@ static int it87_probe(struct platform_device *pdev)
 	/* Now, we do the remaining detection. */
 	if ((data->read(data, IT87_REG_CONFIG) & 0x80) ||
 			data->read(data, IT87_REG_CHIPID) != 0x90) {
-		smbus_enable(data);
+		err = smbus_enable(data);
+		if (err)
+			dev_warn(dev, "Failed to re-enable SMBus: %d\n", err);
 		return -ENODEV;
 	}
 
